@@ -2,14 +2,14 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # ----- CONFIG -----
-$global:PixeldrainUser    = "YOUR_USERNAME"
-$global:PixeldrainApiKey  = "YOUR_API_KEY" # Pixeldrain API key
-$global:DefaultFolder     = (Get-Location).Path
-$global:XzExe             = "xz.exe"       # or "xz" if on PATH
+$global:PixeldrainUser   = "" # Can be left blank; Pixeldrain only checks the API key after the colon
+$global:PixeldrainApiKey = "YOUR_API_KEY"
+$global:DefaultFolder    = (Get-Location).Path
+$global:XzExe            = "xz.exe"
 # -------------------
 
-function Show-Error($msg)  { [System.Windows.Forms.MessageBox]::Show($msg, "Error", "OK", "Error") }
-function Show-Info($msg)   { [System.Windows.Forms.MessageBox]::Show($msg, "Info", "OK", "Information") }
+function Show-Error($msg) { [System.Windows.Forms.MessageBox]::Show($msg, "Error", "OK", "Error") | Out-Null }
+function Show-Info($msg)  { [System.Windows.Forms.MessageBox]::Show($msg, "Info", "OK", "Information") | Out-Null }
 
 function Get-AuthHeader() {
     $token = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($global:PixeldrainUser):$($global:PixeldrainApiKey)"))
@@ -17,34 +17,32 @@ function Get-AuthHeader() {
 }
 
 function Compress-Files($folder, $deleteOriginals) {
-    $patterns = @("*.mp4","*.mkv")
-    $files = Get-ChildItem -Path $folder -Include $patterns -File
+    $files = Get-ChildItem -Path (Join-Path $folder "*") -Include @("*.mp4","*.mkv") -File
     if (-not $files) { Show-Info "No mp4/mkv files found."; return }
     foreach ($f in $files) {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $global:XzExe
-        $psi.Arguments = "-9e --keep `"$($f.FullName)`""
-        $psi.RedirectStandardOutput = $true
+        $psi.Arguments = "-9e -T0 --keep `"$($f.FullName)`""
         $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
         $p = [System.Diagnostics.Process]::Start($psi)
         $p.WaitForExit()
         if ($deleteOriginals -and $p.ExitCode -eq 0) {
-            Remove-Item $f.FullName -Force
+            Remove-Item -LiteralPath $f.FullName -Force
         }
     }
     Show-Info "Compression complete."
 }
 
 function Decompress-Files($folder) {
-    $patterns = @("*.mp4.xz","*.mkv.xz")
-    $files = Get-ChildItem -Path $folder -Include $patterns -File
+    $files = Get-ChildItem -Path (Join-Path $folder "*") -Include @("*.mp4.xz","*.mkv.xz") -File
     if (-not $files) { Show-Info "No .xz files found."; return }
     foreach ($f in $files) {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $global:XzExe
-        $psi.Arguments = "-d --keep `"$($f.FullName)`""
-        $psi.RedirectStandardOutput = $true
+        $psi.Arguments = "-d -T0 --keep `"$($f.FullName)`""
         $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
         $p = [System.Diagnostics.Process]::Start($psi)
         $p.WaitForExit()
     }
@@ -52,25 +50,35 @@ function Decompress-Files($folder) {
 }
 
 function Upload-To-Pixeldrain($filePath) {
-    if (-not (Test-Path $filePath)) { Show-Error "File not found: $filePath"; return }
-    $headers = Get-AuthHeader()
-    $resp = Invoke-RestMethod -Method Post -Uri "https://pixeldrain.com/api/file" -Headers $headers -InFile $filePath -ContentType "application/octet-stream"
-    if ($resp.id) {
-        $url = "https://pixeldrain.com/u/$($resp.id)"
-        Show-Info "Uploaded. Link: $url"
-        return $resp.id
-    } else {
-        Show-Error "Upload failed: $($resp | ConvertTo-Json -Compress)"
+    if (-not (Test-Path -LiteralPath $filePath)) { Show-Error "File not found: $filePath"; return }
+    $headers = Get-AuthHeader
+    $fileName = [uri]::EscapeDataString((Split-Path $filePath -Leaf))
+    try {
+        $resp = Invoke-RestMethod -Method Put -Uri "https://pixeldrain.com/api/file/$fileName" -Headers $headers -InFile $filePath -ContentType "application/octet-stream"
+        if ($resp.id) {
+            $url = "https://pixeldrain.com/u/$($resp.id)"
+            [System.Windows.Forms.Clipboard]::SetText($url)
+            Show-Info "Uploaded! Link copied to clipboard:`n$url"
+            return $resp.id
+        }
+    } catch {
+        Show-Error "Upload failed: $($_.Exception.Message)"
     }
 }
 
 function Download-From-Pixeldrain($fileId, $destFolder) {
     if (-not $fileId) { Show-Error "File ID required."; return }
-    if (-not (Test-Path $destFolder)) { New-Item -ItemType Directory -Path $destFolder | Out-Null }
-    $headers = Get-AuthHeader()
-    $outFile = Join-Path $destFolder "$fileId.bin"
-    Invoke-RestMethod -Method Get -Uri "https://pixeldrain.com/api/file/$fileId" -Headers $headers -OutFile $outFile
-    Show-Info "Downloaded to: $outFile"
+    if (-not (Test-Path -LiteralPath $destFolder)) { New-Item -ItemType Directory -Path $destFolder | Out-Null }
+    $headers = Get-AuthHeader
+    try {
+        $info = Invoke-RestMethod -Method Get -Uri "https://pixeldrain.com/api/file/$fileId/info" -Headers $headers
+        $fileName = if ($info.name) { $info.name } else { "$fileId.bin" }
+        $outFile = Join-Path $destFolder $fileName
+        Invoke-RestMethod -Method Get -Uri "https://pixeldrain.com/api/file/$fileId" -Headers $headers -OutFile $outFile
+        Show-Info "Downloaded to: $outFile"
+    } catch {
+        Show-Error "Download failed: $($_.Exception.Message)"
+    }
 }
 
 # ----- UI -----
@@ -103,6 +111,7 @@ $form.Controls.Add($btnBrowse)
 $chkDelete = New-Object System.Windows.Forms.CheckBox
 $chkDelete.Text = "Delete originals after compression"
 $chkDelete.Location = New-Object System.Drawing.Point(10,50)
+$chkDelete.AutoSize = $true
 $form.Controls.Add($chkDelete)
 
 $btnCompress = New-Object System.Windows.Forms.Button
